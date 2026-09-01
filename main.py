@@ -1,50 +1,35 @@
+import hashlib
+import json
 import math
 import os
-from pathlib import Path
-
-from youtubesearchpython.__future__ import VideosSearch
-
 import re
 import requests
-from requests import HTTPError
-
-from rich.pretty import pprint
-from rich import inspect, print
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.utils.markdown import escape_md
 
-from yaml import load, dump, Loader
+from rich.pretty import pprint
+from rich import inspect, print
 
-from odesli.Odesli import Odesli
-from yt_dlp import YoutubeDL
-from spotipy import Spotify, SpotifyClientCredentials
+from os import mkdir, remove, walk, PathLike
+from os.path import exists
+from pathlib import Path
 
 from tiddl.core.api import TidalAPI, TidalClient, models, exceptions
 from tiddl.core.utils import get_track_stream_data
 from tiddl.core.metadata import add_track_metadata
 from tiddl.cli.utils.auth import load_auth_data
-from tiddl.cli.commands.auth import login
 
-from os import mkdir, remove, walk, PathLike
-from os.path import exists
+from yaml import load, dump, Loader
 
 from logger import Logger
 from tidal_auth import start_pkce_auth, finish_pkce_auth, refresh_pkce_token
-
-# TODO:
-# - Add support for playlists/albums for Spotify and Youtube
-#   - Ability to stop downloading
-# - Multiple pages in search results
-# - Add metadata to MP3 files
-# - Spotify search
-# - "Cache" channel with songs
-# - Migrate to aiogram v3
 
 
 url_regex = r"^(https?:\/\/)?([\da-z\.-]+\.[a-z\.]{2,6})(.*)\/?#?$"
 youtube_domains = ("m.youtube.com", "youtube.com", "www.youtube.com", "youtu.be", "music.youtube.com")
 spotify_domains = ("open.spotify.com",)
+tidal_domains = ("tidal.com",)
 spotify_regex = {
     "track": r"(?:https:\/\/open\.spotify\.com\/playlist\/|spotify:playlist:)([a-zA-Z0-9]+)",
     "album": r"(?:https:\/\/open\.spotify\.com\/album\/|spotify:album:)([a-zA-Z0-9]+)"
@@ -52,45 +37,21 @@ spotify_regex = {
 quality_suffixes = {
     "LOW": "", "HIGH": "", "LOSSLESS": " 🅻", "HI_RES_LOSSLESS": " 🅷",
 }
-stream_suffixes = {
-    "STEREO": "🆂", "DOLBY_ATMOS": "🅳",
-}
 
 log = Logger()
 config = load(open("config.yml"), Loader=Loader)
 bot = Bot(config["bot_token"])
 dp = Dispatcher(bot)
-
-
-odesli = Odesli()
-
-ytdl = YoutubeDL({
-    "format": "bestaudio/best",
-    "outtmpl": "cache/%(id)s.%(ext)s",
-    "cookiefile": "cookies.txt",
-    "postprocessors": [{
-        "key": "FFmpegExtractAudio",
-        "preferredcodec": "mp3",
-        "preferredquality": "320",
-    }],
-})
-
-spotify = Spotify(auth_manager=SpotifyClientCredentials(
-    client_id=config["spotify_id"],
-    client_secret=config["spotify_secret"]
-))
-
+search_cache: dict[str, str] = {}
 
 auth_data = load_auth_data()
 if not auth_data.token:
     login_url = start_pkce_auth()
     print("Login URL:", login_url)
-    resp = input()
+    resp = input("Code or URL > ")
     result = finish_pkce_auth(resp)
     pprint(result)
     auth_data = load_auth_data()
-    # login()
-    # auth_data = load_auth_data()
 
 tidal = TidalAPI(
     TidalClient(
@@ -135,87 +96,6 @@ def save_url(url: str, path: str):
         out.write(r.content)
     return path
 
-
-def parse_duration(string: str) -> int:
-    split = list(map(int, string.split(":")))
-    if len(split) == 2:
-        return split[0]*60 + split[1]
-    elif len(split) == 3:
-        return split[0]*3600 + split[1]*60 + split[2]
-    else:
-        return 0
-
-
-async def handle_song(message: types.Message, song, meta, song_link: str):
-    log.info(f"Downloading [blue]{song.id}[/]")
-    await message.edit_text("⏳ Downloading...")
-    ytdl.download(list(song.linksByPlatform.values())[:1])
-
-    log.info(f"Saving thumbnail for [blue]{song.id}[/]")
-    thumb = save_url(meta.thumbnailUrl, f"cache/{song.id}.jpg")
-
-    log.info(f"Sending [blue]{song.id}[/]")
-    await message.edit_text("⏳ Uploading...")
-    await message.answer_audio(types.InputFile(f"cache/{song.id}.mp3"),
-                               caption=f"_[song\\.link]({song_link})_",
-                               parse_mode="MarkdownV2",
-                               performer=meta.artistName,
-                               title=meta.title,
-                               thumb=open(thumb, "rb"))
-    await message.delete()
-    remove(thumb)
-    remove(f"cache/{song.id}.mp3")
-
-
-async def handle_youtube(message: types.Message, url: str):
-    new = await message.answer("⏳ Acquiring metadata...")
-    result = odesli.getByUrl(url)
-    yt = result.songsByProvider["youtube"]
-    meta = result.songsByProvider["youtube"]
-    if "spotify" in result.songsByProvider.keys():
-        meta = result.songsByProvider["spotify"]
-    else:
-        log.warn(f"No Spotify link found for {url}")
-
-    await handle_song(new, yt, meta, result.songLink)
-
-
-async def handle_inline(message: types.Message, url: str):
-    message.edit_reply_markup(types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton(text=f"⏳ Acquiring metadata...", callback_data=f"nothing")
-    ))
-
-    result = odesli.getByUrl(url)
-    yt = result.songsByProvider["youtube"]
-    meta = result.songsByProvider["youtube"]
-    if "spotify" in result.songsByProvider.keys():
-        meta = result.songsByProvider["spotify"]
-    else:
-        log.warn(f"No Spotify link found for {url}")
-        log.info(f"Downloading [blue]{yt.id}[/]")
-    
-    message.edit_reply_markup(types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton(text=f"⏳ Downloading...", callback_data=f"nothing")
-    ))
-    ytdl.download(list(yt.linksByPlatform.values())[:1])
-
-    log.info(f"Saving thumbnail for [blue]{yt.id}[/]")
-    thumb = save_url(meta.thumbnailUrl, f"cache/{yt.id}.jpg")
-
-    log.info(f"Sending [blue]{yt.id}[/]")
-    message.edit_reply_markup(types.InlineKeyboardMarkup().add(
-        types.InlineKeyboardButton(text=f"⏳ Uploading...", callback_data=f"nothing")
-    ))
-    await message.edit_media(types.InputMedia(f"cache/{yt.id}.mp3"),
-                               caption=f"_[song\\.link]({result.songLink})_",
-                               parse_mode="MarkdownV2",
-                               performer=meta.artistName,
-                               title=meta.title,
-                               thumb=open(thumb, "rb"), reply_markup=types.InlineKeyboardMarkup.clean())
-    remove(thumb)
-    remove(f"cache/{yt.id}.mp3")
-
-
 def track_search(query: str, limit: int = 10, offset: int = 0):
     search = tidal.client.fetch(
         models.Search,
@@ -229,7 +109,7 @@ def tidal_download(track_id: str) -> tuple[models.Track, Path]:
     track_stream = tidal.get_track_stream(track_id, "HI_RES_LOSSLESS")
     stream_data, file_extension = get_track_stream_data(track_stream)
 
-    filename = f"{track_id}_{track_stream.audioQuality}"
+    filename = f"cache/{track_id}_{track_stream.audioQuality}"
     track_path = Path(filename).with_suffix(file_extension)
 
     track_path.write_bytes(stream_data)
@@ -242,61 +122,6 @@ def get_artists(track: models.Track, detailed: bool = False) -> str:
                       else f"[{escape_md(artist.name)}](https://tidal.com/artist/{artist.id})"
                       for artist in track.artists])
 
-
-@dp.message_handler(regexp=url_regex)
-async def handle_url(message: types.Message):
-    # TODO: Add support for playlists (so far only Spotify and Youtube)
-    new = await message.reply("⏳ Acquiring metadata...")
-    try:
-        log.info(f"Got URL: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_id}[/]")
-        result = odesli.getByUrl(message.text)
-        if "youtube" not in result.songsByProvider.keys():
-            log.warn(f"No YouTube link found for [yellow]{message.text}[/]")
-            await new.edit_text("⚠ Song not found!")
-            return
-        yt = result.songsByProvider["youtube"]
-        meta = result.songsByProvider["youtube"]
-        if "spotify" in result.songsByProvider.keys():
-            meta = result.songsByProvider["spotify"]
-        else:
-            log.warn(f"No Spotify link found for [yellow]{message.text}[/]")
-        await handle_song(new, yt, meta, result.songLink)
-    except HTTPError as e:
-        if e.response.status_code >= 400 and e.response.status_code < 500:
-            log.warn(f"Code {e.response.status_code} for {message.text}")
-            log.warn(e.response.json())
-            await new.edit_text("⚠ Song not found!")
-            return
-        else:
-            log.console.print_exception()
-            await new.edit_text("⚠ Unknown HTTP error occurred!")
-    except Exception:
-        log.console.print_exception()
-        await new.edit_text("⚠ Unknown error occurred!")
-        return
-
-
-@dp.message_handler()
-async def handle_text(message: types.Message):
-    log.info(f"Got text: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_user.id}[/]")
-    log.info(f"Searching [blue]{message.text}[/]")
-    new = await message.reply("⏳ Searching...")
-
-    results = track_search(message.text)
-    log.info(f"Got {len(results.items)} results")
-    if len(results.items) == 0:
-        await new.edit_text("🔎 No results found")
-        return
-
-    buttons = []
-    for track in results.items:
-        stream = tidal.get_track_stream(track.id, "HI_RES_LOSSLESS")
-        suffix = quality_suffixes[stream.audioQuality] + " " + stream_suffixes[stream.audioMode]
-        buttons.append([
-            types.InlineKeyboardButton(text=f"{track.title} - {get_artists(track)}{suffix}", callback_data=f"tidal_{track.id}")
-        ])
-    await new.edit_text("🔎 Search results", reply_markup=types.InlineKeyboardMarkup(row_width=1, inline_keyboard=buttons))
-
 def file_size(path: PathLike) -> str:
     size = os.path.getsize(path)
     if size <= 0:
@@ -308,6 +133,72 @@ def file_size(path: PathLike) -> str:
     new_size = round(size / 1024 ** power, 2)
     return f"{new_size}{prefix}B"
 
+def cache_query(query: str) -> str:
+    key = hashlib.md5(query.encode()).hexdigest()[:10]
+    search_cache[key] = query
+    return key
+
+async def process_search(message: types.Message, query: str, limit: int = 10, offset: int = 0):
+    results = track_search(query, limit, offset)
+    log.info(f"Got {len(results.items)} results")
+    if len(results.items) == 0:
+        await message.edit_text("🔎 No results found")
+        return
+
+    buttons = []
+    for track in results.items:
+        stream = tidal.get_track_stream(track.id, "HI_RES_LOSSLESS")
+        suffix = quality_suffixes[stream.audioQuality]
+        callback = {
+            "a": "tidal",
+            "t": str(track.id),
+        }
+        buttons.append([
+            types.InlineKeyboardButton(
+                text=f"{track.title} - {get_artists(track)}{suffix}",
+                callback_data=json.dumps(callback)
+            ),
+        ])
+
+    has_prev = offset > 0
+    has_next = (offset + len(results.items)) < results.totalNumberOfItems
+
+    qkey = cache_query(query)
+
+    prev_callback = json.dumps({
+        "a": "search",
+        "q": qkey,
+        "o": max(0, offset - limit),
+    }) if has_prev else "nothing"
+
+    next_callback = json.dumps({
+        "a": "search",
+        "q": qkey,
+        "o": offset + limit,
+    }) if has_next else "nothing"
+
+    current_page = (offset // limit) + 1
+    total_pages = math.ceil(results.totalNumberOfItems / limit) if results.totalNumberOfItems > 0 else 1
+
+    buttons.append([
+        types.InlineKeyboardButton("<" if has_prev else "-", callback_data=prev_callback),
+        types.InlineKeyboardButton(f"{current_page}/{total_pages}", callback_data="nothing"),
+        types.InlineKeyboardButton(">" if has_next else "-", callback_data=next_callback),
+    ])
+
+    await message.edit_text(
+        "🔎 Search results",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@dp.message_handler()
+async def handle_text(message: types.Message):
+    log.info(f"Got text: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_user.id}[/]")
+    log.info(f"Searching [blue]{message.text}[/]")
+    new = await message.reply("⏳ Searching...")
+    await process_search(new, query=message.text)
+
 
 @dp.callback_query_handler()
 async def handle_callback(query: types.CallbackQuery):
@@ -315,15 +206,13 @@ async def handle_callback(query: types.CallbackQuery):
     if query.data == "nothing":
         await query.answer()
         return
-    split = query.data.split("_", maxsplit=1)
-    if len(split) != 2:
-        await query.answer("Invalid query specified")
-        return
-    category, payload = split
-    match category:
+
+    callback_data = json.loads(query.data) # TODO: check format
+
+    match callback_data["a"]:
         case "tidal":
             message = await query.message.answer("⏳ Downloading...")
-            track, path = tidal_download(payload)
+            track, path = tidal_download(callback_data["t"])
             log.info(f"Saved {track.title} ({track.id}) for [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
 
             log.info(f"Sending [blue]{track.id}[/]")
@@ -342,51 +231,14 @@ async def handle_callback(query: types.CallbackQuery):
                                        title=track.title)
             await message.delete()
             remove(path)
-
-
-        case "download":
-            await handle_youtube(query.message, payload)
-        case "inline":
-            await handle_inline(query.message, payload)
+        case "search":
+                original_query = search_cache.get(callback_data["q"])
+                if original_query is None:
+                    await query.answer("Search expired, please search again")
+                    return
+                await process_search(query.message, original_query, offset=callback_data["o"])
         case _:
             await query.answer("Invalid query specified")
-
-
-@dp.inline_handler()
-async def inline_handler(inline_query: types.InlineQuery):
-    # inspect(inline_query)
-    query = inline_query.query.strip()
-    if query == "":
-        return
-
-    search = VideosSearch(query, limit=config["search_limit"])
-    print(query)
-    results = (await search.next())["result"]
-    if len(results) == 0:
-        return
-
-    query_results = []
-    for i, vid in enumerate(results):
-        thumb = vid["thumbnails"][0]
-        query_results.append(
-            types.InlineQueryResultArticle(
-                id=str(i),
-                title=vid["title"],
-                description=vid["duration"],
-                thumb_url=thumb["url"],
-                thumb_height=thumb["height"],
-                thumb_width=thumb["width"],
-                input_message_content=types.InputTextMessageContent(
-                    f"⬇ _[YouTube]({vid['link']})_",
-                    parse_mode="MarkdownV2",
-                    disable_web_page_preview=True
-                ),
-                reply_markup=types.InlineKeyboardMarkup().add(
-                    types.InlineKeyboardButton(text=f"Download", callback_data=f"inline_{vid['link']}")
-                )
-            )
-        )
-    await bot.answer_inline_query(inline_query.id, results=query_results, cache_time=1)
 
 
 if __name__ == "__main__":
