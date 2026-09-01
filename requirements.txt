@@ -1,9 +1,11 @@
-aiogram~=2.22.2
+aiogram<3.0.0
 asyncio
+mutagen
 odesli
 pyyaml
 requests
 rich
 spotipy
+tiddl>=3.0.0
 youtube-search-python
 yt_dlp

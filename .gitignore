@@ -4,4 +4,5 @@ cache/
 .idea
 
 config.yml
+tidal_cache.sqlite
 cookies.txt
