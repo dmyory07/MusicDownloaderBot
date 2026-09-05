@@ -6,6 +6,7 @@ import re
 import requests
 
 from aiogram import Bot, Dispatcher, executor, types
+from aiogram.bot.api import TelegramAPIServer
 from aiogram.utils.markdown import escape_md
 
 from rich.pretty import pprint
@@ -40,7 +41,7 @@ quality_suffixes = {
 
 log = Logger()
 config = load(open("config.yml"), Loader=Loader)
-bot = Bot(config["bot_token"])
+bot = Bot(config["bot_token"], server=TelegramAPIServer.from_base("http://localhost:8081"))
 dp = Dispatcher(bot)
 search_cache: dict[str, str] = {}
 
@@ -105,7 +106,7 @@ def track_search(query: str, limit: int = 10, offset: int = 0):
     )
     return search.tracks
 
-def tidal_download(track_id: str) -> tuple[models.Track, Path]:
+def tidal_download(track_id: str) -> tuple[models.Track, models.TrackStream, Path]:
     track_stream = tidal.get_track_stream(track_id, "HI_RES_LOSSLESS")
     stream_data, file_extension = get_track_stream_data(track_stream)
 
@@ -115,7 +116,7 @@ def tidal_download(track_id: str) -> tuple[models.Track, Path]:
     track_path.write_bytes(stream_data)
     track = tidal.get_track(track_id)
     # add_track_metadata(track_path, track)
-    return track, track_path
+    return track, track_stream, track_path
 
 def get_artists(track: models.Track, detailed: bool = False) -> str:
     return ", ".join([artist.name if not detailed
@@ -212,23 +213,24 @@ async def handle_callback(query: types.CallbackQuery):
     match callback_data["a"]:
         case "tidal":
             message = await query.message.answer("⏳ Downloading...")
-            track, path = tidal_download(callback_data["t"])
+            track, stream, path = tidal_download(callback_data["t"])
             log.info(f"Saved {track.title} ({track.id}) for [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
 
             log.info(f"Sending [blue]{track.id}[/]")
             await message.edit_text("⏳ Uploading...")
-                                       # thumb=open(thumb, "rb"))
-            await message.answer(f"""{get_artists(track, True)} \\- {escape_md(track.title)} \\(`{track.id}`\\)
-**BPM**: {track.bpm}
-**Album**: [{escape_md(track.album.title)}](https://tidal.com/album/{track.album.id})
-**Quality**: {track.audioQuality}
-**Size**: {escape_md(file_size(path))}""", parse_mode="MarkdownV2", disable_web_page_preview=True)
 
             await message.answer_audio(types.InputFile(path),
                                        # caption=f"_[song\\.link]({song_link})_",
                                        parse_mode="MarkdownV2",
                                        performer=get_artists(track),
                                        title=track.title)
+
+            await message.answer(f"""{get_artists(track, True)} \\- {escape_md(track.title)} \\(`{track.id}`\\)
+**BPM**: {track.bpm}
+**Album**: [{escape_md(track.album.title)}](https://tidal.com/album/{track.album.id})
+**Quality**: {escape_md(stream.audioQuality)} / {stream.bitDepth}\\-bit {escape_md(f'{stream.sampleRate/1000:g}')} kHz 
+**Size**: {escape_md(file_size(path))}""", parse_mode="MarkdownV2", disable_web_page_preview=True)
+
             await message.delete()
             remove(path)
         case "search":
