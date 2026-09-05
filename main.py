@@ -5,16 +5,19 @@ import os
 import re
 import requests
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.bot.api import TelegramAPIServer
 from aiogram.utils.markdown import escape_md
 
-from rich.pretty import pprint
-from rich import inspect, print
-
 from os import mkdir, remove, walk, PathLike
 from os.path import exists
 from pathlib import Path
+
+from rich import inspect, print
+from rich.pretty import pprint
 
 from tiddl.core.api import TidalAPI, TidalClient, models, exceptions
 from tiddl.core.utils import get_track_stream_data
@@ -53,6 +56,9 @@ if not auth_data.token:
     result = finish_pkce_auth(resp)
     pprint(result)
     auth_data = load_auth_data()
+
+tidal_executor = ThreadPoolExecutor(max_workers=16)
+download_executor = ThreadPoolExecutor(max_workers=16)
 
 tidal = TidalAPI(
     TidalClient(
@@ -97,28 +103,39 @@ def save_url(url: str, path: str):
         out.write(r.content)
     return path
 
-def track_search(query: str, limit: int = 10, offset: int = 0):
-    search = tidal.client.fetch(
-        models.Search,
-        "search",
-        {"countryCode": tidal.country_code, "query": query, "offset": offset, "limit": limit},
-        expire_after=0x0D0E0200020704, # DO_NOT_CACHE
-    )
+async def tidal_search(query: str, limit: int = 10, offset: int = 0) -> models.Search.Tracks:
+    # TODO: migrate to asyncio / write own parts of TidalAPI
+    def blocking_search() -> models.Search:
+        return tidal.client.fetch(
+           models.Search,
+           "search",
+           {"countryCode": tidal.country_code, "query": query, "offset": offset, "limit": limit},
+           expire_after=0x0D0E0200020704
+       )
+
+    loop = asyncio.get_running_loop()
+    search = await loop.run_in_executor(tidal_executor, blocking_search)
     return search.tracks
 
-def tidal_download(track_id: str) -> tuple[models.Track, models.TrackStream, Path]:
-    track_stream = tidal.get_track_stream(track_id, "HI_RES_LOSSLESS")
-    stream_data, file_extension = get_track_stream_data(track_stream)
+async def tidal_download(track_id: str) -> tuple[models.Track, models.TrackStream, Path]:
+    def blocking_download():
+        track_stream = tidal.get_track_stream(track_id, "HI_RES_LOSSLESS")
+        stream_data, file_extension = get_track_stream_data(track_stream)
 
-    filename = f"cache/{track_id}_{track_stream.audioQuality}"
-    track_path = Path(filename).with_suffix(file_extension)
+        filename = f"cache/{track_id}_{track_stream.audioQuality}"
+        track_path = Path(filename).with_suffix(file_extension)
 
-    track_path.write_bytes(stream_data)
-    track = tidal.get_track(track_id)
-    # add_track_metadata(track_path, track)
-    return track, track_stream, track_path
+        track_path.write_bytes(stream_data)
+        track = tidal.get_track(track_id)
+        # add_track_metadata(track_path, track)
+        return track, track_stream, track_path
 
-def get_artists(track: models.Track, detailed: bool = False) -> str:
+    loop = asyncio.get_running_loop()
+    res = await loop.run_in_executor(download_executor, blocking_download)
+    return res
+
+
+def tidal_artists(track: models.Track, detailed: bool = False) -> str:
     return ", ".join([artist.name if not detailed
                       else f"[{escape_md(artist.name)}](https://tidal.com/artist/{artist.id})"
                       for artist in track.artists])
@@ -140,15 +157,16 @@ def cache_query(query: str) -> str:
     return key
 
 async def process_search(message: types.Message, query: str, limit: int = 10, offset: int = 0):
-    results = track_search(query, limit, offset)
+    results = await tidal_search(query, limit, offset)
     log.info(f"Got {len(results.items)} results")
     if len(results.items) == 0:
         await message.edit_text("🔎 No results found")
         return
 
     buttons = []
+    loop = asyncio.get_running_loop()
     for track in results.items:
-        stream = tidal.get_track_stream(track.id, "HI_RES_LOSSLESS")
+        stream: models.TrackStream = await loop.run_in_executor(tidal_executor, tidal.get_track_stream, track.id, "HI_RES_LOSSLESS")
         suffix = quality_suffixes[stream.audioQuality]
         callback = {
             "a": "tidal",
@@ -156,7 +174,7 @@ async def process_search(message: types.Message, query: str, limit: int = 10, of
         }
         buttons.append([
             types.InlineKeyboardButton(
-                text=f"{track.title} - {get_artists(track)}{suffix}",
+                text=f"{track.title} - {tidal_artists(track)}{suffix}",
                 callback_data=json.dumps(callback)
             ),
         ])
@@ -213,7 +231,7 @@ async def handle_callback(query: types.CallbackQuery):
     match callback_data["a"]:
         case "tidal":
             message = await query.message.answer("⏳ Downloading...")
-            track, stream, path = tidal_download(callback_data["t"])
+            track, stream, path = await tidal_download(callback_data["t"])
             log.info(f"Saved {track.title} ({track.id}) for [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
 
             log.info(f"Sending [blue]{track.id}[/]")
@@ -222,10 +240,10 @@ async def handle_callback(query: types.CallbackQuery):
             await message.answer_audio(types.InputFile(path),
                                        # caption=f"_[song\\.link]({song_link})_",
                                        parse_mode="MarkdownV2",
-                                       performer=get_artists(track),
+                                       performer=tidal_artists(track),
                                        title=track.title)
 
-            await message.answer(f"""{get_artists(track, True)} \\- {escape_md(track.title)} \\(`{track.id}`\\)
+            await message.answer(f"""{tidal_artists(track, True)} \\- {escape_md(track.title)} \\(`{track.id}`\\)
 **BPM**: {track.bpm}
 **Album**: [{escape_md(track.album.title)}](https://tidal.com/album/{track.album.id})
 **Quality**: {escape_md(stream.audioQuality)} / {stream.bitDepth}\\-bit {escape_md(f'{stream.sampleRate/1000:g}')} kHz 
