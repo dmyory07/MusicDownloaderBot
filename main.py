@@ -3,6 +3,8 @@ import json
 import math
 import os
 import re
+from typing import Optional
+
 import requests
 
 import asyncio
@@ -19,6 +21,8 @@ from pathlib import Path
 from rich import inspect, print
 from rich.pretty import pprint
 
+from spotipy import Spotify, SpotifyClientCredentials
+
 from tiddl.core.api import TidalAPI, TidalClient, models, exceptions
 from tiddl.core.utils import get_track_stream_data
 from tiddl.core.metadata import add_track_metadata
@@ -31,13 +35,25 @@ from tidal_auth import start_pkce_auth, finish_pkce_auth, refresh_pkce_token
 
 
 url_regex = r"^(https?:\/\/)?([\da-z\.-]+\.[a-z\.]{2,6})(.*)\/?#?$"
-youtube_domains = ("m.youtube.com", "youtube.com", "www.youtube.com", "youtu.be", "music.youtube.com")
-spotify_domains = ("open.spotify.com",)
-tidal_domains = ("tidal.com",)
-spotify_regex = {
-    "track": r"(?:https:\/\/open\.spotify\.com\/playlist\/|spotify:playlist:)([a-zA-Z0-9]+)",
-    "album": r"(?:https:\/\/open\.spotify\.com\/album\/|spotify:album:)([a-zA-Z0-9]+)"
+domains = {
+    # "youtube": ("m.youtube.com", "youtube.com", "www.youtube.com", "youtu.be", "music.youtube.com"),
+    "spotify": ("open.spotify.com",),
+    "tidal": ("www.tidal.com", "tidal.com",),
 }
+patterns = {
+    # "youtube": dict(),
+    "spotify": {
+        "track": r"(?:https?:\/\/open\.spotify\.com\/track\/|spotify:track:)([a-zA-Z0-9]+)",
+        "playlist": r"(?:https:\/\/open\.spotify\.com\/playlist\/|spotify:playlist:)([a-zA-Z0-9]+)",
+        "album": r"(?:https:\/\/open\.spotify\.com\/album\/|spotify:album:)([a-zA-Z0-9]+)"
+    },
+    "tidal": {
+        "track": r"(?:https?:\/\/(?:www\.)?tidal\.com\/(?:browse\/)?track\/|tidal:track:)(\d+)",
+        "album": r"(?:https?:\/\/(?:www\.)?tidal\.com\/(?:browse\/)?album\/|tidal:album:)(\d+)",
+        "playlist": r"(?:https?:\/\/(?:www\.)?tidal\.com\/(?:browse\/)?playlist\/|tidal:playlist:)([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
+    }
+}
+
 quality_suffixes = {
     "LOW": "", "HIGH": "", "LOSSLESS": " 🅻", "HI_RES_LOSSLESS": " 🅷",
 }
@@ -57,7 +73,7 @@ if not auth_data.token:
     pprint(result)
     auth_data = load_auth_data()
 
-tidal_executor = ThreadPoolExecutor(max_workers=16)
+api_executor = ThreadPoolExecutor(max_workers=16)
 download_executor = ThreadPoolExecutor(max_workers=16)
 
 tidal = TidalAPI(
@@ -68,6 +84,11 @@ tidal = TidalAPI(
     country_code=auth_data.country_code,
     user_id=auth_data.user_id,
 )
+
+spotify = Spotify(auth_manager=SpotifyClientCredentials(
+    client_id=config["spotify_id"],
+    client_secret=config["spotify_secret"]
+))
 
 try:
     session = tidal.get_session()
@@ -114,7 +135,7 @@ async def tidal_search(query: str, limit: int = 10, offset: int = 0) -> models.S
        )
 
     loop = asyncio.get_running_loop()
-    search = await loop.run_in_executor(tidal_executor, blocking_search)
+    search = await loop.run_in_executor(api_executor, blocking_search)
     return search.tracks
 
 async def tidal_download(track_id: str) -> tuple[models.Track, models.TrackStream, Path]:
@@ -133,7 +154,6 @@ async def tidal_download(track_id: str) -> tuple[models.Track, models.TrackStrea
     loop = asyncio.get_running_loop()
     res = await loop.run_in_executor(download_executor, blocking_download)
     return res
-
 
 def tidal_artists(track: models.Track, detailed: bool = False) -> str:
     return ", ".join([artist.name if not detailed
@@ -166,7 +186,7 @@ async def process_search(message: types.Message, query: str, limit: int = 10, of
     buttons = []
     loop = asyncio.get_running_loop()
     for track in results.items:
-        stream: models.TrackStream = await loop.run_in_executor(tidal_executor, tidal.get_track_stream, track.id, "HI_RES_LOSSLESS")
+        stream: models.TrackStream = await loop.run_in_executor(api_executor, tidal.get_track_stream, track.id, "HI_RES_LOSSLESS")
         suffix = quality_suffixes[stream.audioQuality]
         callback = {
             "a": "tidal",
@@ -210,6 +230,83 @@ async def process_search(message: types.Message, query: str, limit: int = 10, of
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
+def isrc_tidal(isrc: str) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {auth_data.token}",
+        "Accept": "application/vnd.api+json"
+    }
+
+    payload = {
+        "filter[isrc]": isrc,
+        "countryCode": auth_data.country_code,
+    }
+
+    req = requests.get("https://openapi.tidal.com/v2/tracks", params=payload, headers=headers)
+    if req.status_code != 200 or req.json().get("data") is None or len(req.json().get("data")) == 0:
+        return None
+    return req.json().get("data")[0].get("id")
+
+async def process_tidal(message: types.Message, track_id: str):
+    message = await message.answer("⏳ Downloading...")
+    track, stream, path = await tidal_download(track_id)
+    log.info(f"Saved {track.title} ({track.id})")
+
+    log.info(f"Sending [blue]{track.id}[/]")
+    await message.edit_text("⏳ Uploading...")
+
+    await message.answer_audio(types.InputFile(path),
+                               # caption=f"_[song\\.link]({song_link})_",
+                               parse_mode="MarkdownV2",
+                               performer=tidal_artists(track),
+                               title=track.title)
+
+    await message.answer(f"""{tidal_artists(track, True)} \\- {escape_md(track.title)} \\(`{track.id}`\\)
+**BPM**: {track.bpm}
+**Album**: [{escape_md(track.album.title)}](https://tidal.com/album/{track.album.id})
+**Quality**: {escape_md(stream.audioQuality)} / {stream.bitDepth}\\-bit {escape_md(f'{stream.sampleRate/1000:g}')} kHz 
+**Size**: {escape_md(file_size(path))}""", parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+    await message.delete()
+    remove(path)
+
+async def process_url(message: types.Message, provider: str, media_type: str, url: str):
+    if media_type != "track":
+        await message.reply(f"Unfortunately {media_type}s are not supported yet.")
+        return
+
+    loop = asyncio.get_running_loop()
+
+    match provider:
+        case "youtube":
+            await message.reply("YouTube is not currently supported.")
+        case "spotify":
+            track = await loop.run_in_executor(api_executor, spotify.track, url)
+            if not "isrc" in track["external_ids"]:
+                await message.reply("Track not found.")
+                # TODO: implement basic search
+            isrc = track["external_ids"]["isrc"]
+            track_id = await loop.run_in_executor(api_executor, isrc_tidal, isrc)
+            await process_tidal(message, track_id)
+        case "tidal":
+            re_match = re.match(patterns["tidal"]["track"], url)
+            track_id = re_match.group(1)
+            await process_tidal(message, track_id)
+        case _:
+            await message.reply("Unsupported provider.")
+
+@dp.message_handler(regexp=url_regex)
+async def handle_url(message: types.Message):
+    re_match = re.match(url_regex, message.text)
+    domain = re_match.group(2)
+    for provider, urls in domains.items():
+        if not domain in urls: continue
+        media_type = None
+        for med, tpat in patterns[provider].items():
+            media_type = med if re.match(tpat, message.text) else media_type
+        await process_url(message, provider, media_type, message.text)
+        return
+    await message.reply(f"{domain} is not currently supported.")
+
 
 @dp.message_handler()
 async def handle_text(message: types.Message):
@@ -230,27 +327,7 @@ async def handle_callback(query: types.CallbackQuery):
 
     match callback_data["a"]:
         case "tidal":
-            message = await query.message.answer("⏳ Downloading...")
-            track, stream, path = await tidal_download(callback_data["t"])
-            log.info(f"Saved {track.title} ({track.id}) for [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
-
-            log.info(f"Sending [blue]{track.id}[/]")
-            await message.edit_text("⏳ Uploading...")
-
-            await message.answer_audio(types.InputFile(path),
-                                       # caption=f"_[song\\.link]({song_link})_",
-                                       parse_mode="MarkdownV2",
-                                       performer=tidal_artists(track),
-                                       title=track.title)
-
-            await message.answer(f"""{tidal_artists(track, True)} \\- {escape_md(track.title)} \\(`{track.id}`\\)
-**BPM**: {track.bpm}
-**Album**: [{escape_md(track.album.title)}](https://tidal.com/album/{track.album.id})
-**Quality**: {escape_md(stream.audioQuality)} / {stream.bitDepth}\\-bit {escape_md(f'{stream.sampleRate/1000:g}')} kHz 
-**Size**: {escape_md(file_size(path))}""", parse_mode="MarkdownV2", disable_web_page_preview=True)
-
-            await message.delete()
-            remove(path)
+            await process_tidal(query.message, callback_data["t"])
         case "search":
                 original_query = search_cache.get(callback_data["q"])
                 if original_query is None:
