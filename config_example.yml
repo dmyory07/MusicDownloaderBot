@@ -2,5 +2,6 @@
 bot_token: "BOT_TOKEN"
 spotify_id: "SPOTIFY_ID"
 spotify_secret: "SPOTIFY_SECRET"
+admin_id: null
 playlist_limit: 25
 search_limit: 10

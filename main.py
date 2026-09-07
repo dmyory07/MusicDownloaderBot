@@ -3,9 +3,10 @@ import json
 import math
 import os
 import re
-from typing import Optional
-
 import requests
+import traceback
+
+from typing import Optional
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
@@ -59,7 +60,8 @@ quality_suffixes = {
 
 log = Logger()
 config = load(open("config.yml"), Loader=Loader)
-bot = Bot(config["bot_token"], server=TelegramAPIServer.from_base("http://localhost:8081"))
+# bot = Bot(config["bot_token"], server=TelegramAPIServer.from_base("http://localhost:8081"))
+bot = Bot(config["bot_token"])
 dp = Dispatcher(bot)
 search_cache: dict[str, str] = {}
 
@@ -281,48 +283,74 @@ async def process_url(message: types.Message, provider: str, media_type: str, ur
         case _:
             await message.reply("Unsupported provider.")
 
+async def report_exception(user: types.User, payload: str, e: Exception):
+    # await user.reply("⚠ Unknown error occurred")
+    await bot.send_message(user.id, "⚠ Unknown error occurred")
+    log.error(f"[bold]{repr(e)}[/] occurred while trying to process [bold]{payload}[/] from [bold]{user.full_name}[/] / [bold]{user.id}[/]")
+    log.console.print_exception()
+    if "admin_id" not in config or config["admin_id"] is None:
+        return
+    await bot.send_message(config["admin_id"], f"""Exception: `{escape_md(type(e).__name__)}` occurred
+Message: {escape_md(str(e))}
+Payload: `{escape_md(payload)}`
+User: [{escape_md(user.full_name)}](tg://user?id={user.id})
+Traceback: 
+```
+{escape_md(traceback.format_exc())}
+```""", parse_mode="MarkdownV2", disable_web_page_preview=True)
+
+
 @dp.message_handler(regexp=url_regex)
 async def handle_url(message: types.Message):
-    re_match = re.match(url_regex, message.text)
-    domain = re_match.group(2)
-    for provider, urls in domains.items():
-        if not domain in urls: continue
-        media_type = None
-        for med, tpat in patterns[provider].items():
-            media_type = med if re.match(tpat, message.text) else media_type
-        await process_url(message, provider, media_type, message.text)
-        return
-    await message.reply(f"{domain} is not currently supported.")
+    try:
+        re_match = re.match(url_regex, message.text)
+        domain = re_match.group(2)
+        for provider, urls in domains.items():
+            if not domain in urls: continue
+            media_type = None
+            for med, tpat in patterns[provider].items():
+                media_type = med if re.match(tpat, message.text) else media_type
+            await process_url(message, provider, media_type, message.text)
+            return
+        await message.reply(f"{domain} is not currently supported.")
+    except Exception as e:
+        await report_exception(message.from_user, str(e), e)
 
 
 @dp.message_handler()
 async def handle_text(message: types.Message):
-    log.info(f"Got text: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_user.id}[/]")
-    log.info(f"Searching [blue]{message.text}[/]")
-    new = await message.reply("⏳ Searching...")
-    await process_search(new, query=message.text)
+    try:
+        log.info(f"Got text: [blue]{message.text}[/] from [blue]{message.from_user.full_name}[/] / [blue]{message.from_user.id}[/]")
+        log.info(f"Searching [blue]{message.text}[/]")
+        new = await message.reply("⏳ Searching...")
+        await process_search(new, query=message.text)
+    except Exception as e:
+        await report_exception(message.from_user, message.text, e)
 
 
 @dp.callback_query_handler()
 async def handle_callback(query: types.CallbackQuery):
-    log.info(f"Got callback: [blue]{query.data}[/] from [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
-    if query.data == "nothing":
-        await query.answer()
-        return
+    try:
+        log.info(f"Got callback: [blue]{query.data}[/] from [blue]{query.from_user.full_name}[/] / [blue]{query.from_user.id}[/]")
+        if query.data == "nothing":
+            await query.answer()
+            return
 
-    callback_data = json.loads(query.data) # TODO: check format
+        callback_data = json.loads(query.data) # TODO: check format
 
-    match callback_data["a"]:
-        case "tidal":
-            await process_tidal(query.message, callback_data["t"])
-        case "search":
-                original_query = search_cache.get(callback_data["q"])
-                if original_query is None:
-                    await query.answer("Search expired, please search again")
-                    return
-                await process_search(query.message, original_query, offset=callback_data["o"])
-        case _:
-            await query.answer("Invalid query specified")
+        match callback_data["a"]:
+            case "tidal":
+                await process_tidal(query.message, callback_data["t"])
+            case "search":
+                    original_query = search_cache.get(callback_data["q"])
+                    if original_query is None:
+                        await query.answer("Search expired, please search again")
+                        return
+                    await process_search(query.message, original_query, offset=callback_data["o"])
+            case _:
+                await query.answer("Invalid query specified")
+    except Exception as e:
+        await report_exception(query.from_user, query.data, e)
 
 
 if __name__ == "__main__":

@@ -11,8 +11,6 @@ from tiddl.core.api import TidalAPI, TidalClient
 from tiddl.core.api.exceptions import ApiError
 from tiddl.cli.utils.auth import AuthData, save_auth_data, load_auth_data
 
-from main import log
-
 PKCE_CLIENT_ID = "6BDSRdpK9hqEBTgU"
 PKCE_CLIENT_SECRET = "xeuPmY7nbpZ9IIbLAcQ93shka1VNheUAqN6IcszjTG8="
 PKCE_REDIRECT_URI = "https://tidal.com/android/login/auth"
@@ -106,11 +104,11 @@ def check_pkce_token(tidal: TidalAPI):
     try:
         session = tidal.get_session()
     except ApiError as e:
-        log.warn(e.user_message)
-        log.info("Refreshing token...")
+        # log.warn(e.user_message)
+        # log.info("Refreshing token...")
         result = refresh_pkce_token(auth_data.refresh_token)
         auth_data = load_auth_data()
-        log.success("Token refreshed")
+        # log.success("Token refreshed")
         tidal.client = TidalClient(
             token=auth_data.token,
             cache_name="./tidal_cache",
