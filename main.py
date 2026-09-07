@@ -23,7 +23,7 @@ from rich.pretty import pprint
 
 from spotipy import Spotify, SpotifyClientCredentials
 
-from tiddl.core.api import TidalAPI, TidalClient, models, exceptions
+from tiddl.core.api import TidalAPI, TidalClient, models
 from tiddl.core.utils import get_track_stream_data
 from tiddl.core.metadata import add_track_metadata
 from tiddl.cli.utils.auth import load_auth_data
@@ -31,8 +31,7 @@ from tiddl.cli.utils.auth import load_auth_data
 from yaml import load, dump, Loader
 
 from logger import Logger
-from tidal_auth import start_pkce_auth, finish_pkce_auth, refresh_pkce_token
-
+from tidal_auth import start_pkce_auth, finish_pkce_auth, refresh_pkce_token, check_pkce_token
 
 url_regex = r"^(https?:\/\/)?([\da-z\.-]+\.[a-z\.]{2,6})(.*)\/?#?$"
 domains = {
@@ -84,28 +83,13 @@ tidal = TidalAPI(
     country_code=auth_data.country_code,
     user_id=auth_data.user_id,
 )
+check_pkce_token(tidal)
 
 spotify = Spotify(auth_manager=SpotifyClientCredentials(
     client_id=config["spotify_id"],
     client_secret=config["spotify_secret"]
 ))
 
-try:
-    session = tidal.get_session()
-except exceptions.ApiError as e:
-    log.warn(e.user_message)
-    log.info("Refreshing token...")
-    result = refresh_pkce_token(auth_data.refresh_token)
-    auth_data = load_auth_data()
-    tidal = TidalAPI(
-        TidalClient(
-            token=auth_data.token,
-            cache_name="./tidal_cache",
-        ),
-        country_code=auth_data.country_code,
-        user_id=auth_data.user_id,
-    )
-    log.success("Token refreshed")
 
 if not exists("cache"):
     mkdir("cache")
@@ -127,6 +111,7 @@ def save_url(url: str, path: str):
 async def tidal_search(query: str, limit: int = 10, offset: int = 0) -> models.Search.Tracks:
     # TODO: migrate to asyncio / write own parts of TidalAPI
     def blocking_search() -> models.Search:
+        check_pkce_token(tidal)
         return tidal.client.fetch(
            models.Search,
            "search",
@@ -140,6 +125,8 @@ async def tidal_search(query: str, limit: int = 10, offset: int = 0) -> models.S
 
 async def tidal_download(track_id: str) -> tuple[models.Track, models.TrackStream, Path]:
     def blocking_download():
+        check_pkce_token(tidal)
+
         track_stream = tidal.get_track_stream(track_id, "HI_RES_LOSSLESS")
         stream_data, file_extension = get_track_stream_data(track_stream)
 

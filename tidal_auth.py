@@ -3,10 +3,15 @@ import hashlib
 import os
 import secrets
 import time
-from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 
-from tiddl.cli.utils.auth import AuthData, save_auth_data
+from urllib.parse import parse_qs, urlencode, urlparse
+
+from tiddl.core.api import TidalAPI, TidalClient
+from tiddl.core.api.exceptions import ApiError
+from tiddl.cli.utils.auth import AuthData, save_auth_data, load_auth_data
+
+from main import log
 
 PKCE_CLIENT_ID = "6BDSRdpK9hqEBTgU"
 PKCE_CLIENT_SECRET = "xeuPmY7nbpZ9IIbLAcQ93shka1VNheUAqN6IcszjTG8="
@@ -95,6 +100,21 @@ def finish_pkce_auth(redirect_url_or_code: str) -> dict:
     PKCE_STATE.clear()
     return {"ok": True, "user_id": data.get("user_id"), "country": user.get("countryCode")}
 
+
+def check_pkce_token(tidal: TidalAPI):
+    auth_data = load_auth_data()
+    try:
+        session = tidal.get_session()
+    except ApiError as e:
+        log.warn(e.user_message)
+        log.info("Refreshing token...")
+        result = refresh_pkce_token(auth_data.refresh_token)
+        auth_data = load_auth_data()
+        log.success("Token refreshed")
+        tidal.client = TidalClient(
+            token=auth_data.token,
+            cache_name="./tidal_cache",
+        )
 
 def refresh_pkce_token(refresh_token: str) -> dict:
     res = requests.post(
