@@ -60,8 +60,9 @@ quality_suffixes = {
 
 log = Logger()
 config = load(open("config.yml"), Loader=Loader)
-# bot = Bot(config["bot_token"], server=TelegramAPIServer.from_base("http://localhost:8081"))
-bot = Bot(config["bot_token"])
+bot = Bot(config["bot_token"], server=TelegramAPIServer.from_base("http://localhost:8081"))
+# bot = Bot(config["bot_token"])
+# TODO: ^^^ config.yaml ^^^
 dp = Dispatcher(bot)
 search_cache: dict[str, str] = {}
 
